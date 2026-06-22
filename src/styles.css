@@ -245,7 +245,7 @@ p {
   grid-row: 2;
   padding: 7px;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 7px;
 }
 
@@ -257,6 +257,11 @@ p {
 .utilityDock .activeTool {
   border-color: #e2b750;
   color: #f6d77e;
+}
+
+.utilityDock .leaveRoomButton {
+  border-color: rgba(255, 138, 138, 0.26);
+  color: #ffb0b0;
 }
 
 .utilityDock button.hasAlert::after {
@@ -1216,6 +1221,97 @@ p {
   overflow-wrap: anywhere;
 }
 
+.replayEventCards {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.replayEventCards > span {
+  color: #e2b750;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.replayEventCards .miniShowCards {
+  width: min(170px, 100%);
+}
+
+.replayHandCard {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(14, 22, 32, 0.94);
+  border: 1px solid rgba(226, 183, 80, 0.18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.replayHandCard + .replayHandCard {
+  margin-top: 12px;
+  border-top-color: rgba(226, 183, 80, 0.34);
+}
+
+.replayHandHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.replayHandHeader strong {
+  color: #f6d77e;
+}
+
+.replayBoardCards {
+  display: grid;
+  gap: 8px;
+}
+
+.replayBoardRow {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.replayBoardRow strong {
+  color: #e2b750;
+  font-size: 12px;
+}
+
+.replayActionLine {
+  display: grid;
+  gap: 4px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.replayAwards {
+  display: grid;
+  gap: 3px;
+  color: #b7c2d2;
+}
+
+.settlementReplayBoard {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.settlementReplayBoard > strong {
+  color: #e2b750;
+  font-size: 12px;
+}
+
 .settlementReplay {
   display: grid;
   gap: 6px;
@@ -1356,6 +1452,9 @@ p {
   padding: 16px;
   box-shadow: 0 22px 80px rgba(0, 0, 0, 0.5);
   color: #edf4ff;
+  cursor: move;
+  user-select: none;
+  touch-action: none;
 }
 
 .settlementBanner h3 {
@@ -1369,10 +1468,87 @@ p {
   gap: 8px;
 }
 
+.replayShowdownTable {
+  display: grid;
+  grid-template-columns: minmax(76px, 0.8fr) minmax(124px, 1.5fr) minmax(42px, 0.45fr) repeat(3, minmax(78px, 0.8fr));
+  gap: 5px 8px;
+  align-items: center;
+  padding: 8px;
+  border-radius: 8px;
+  background: #0e1620;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  overflow-x: auto;
+  font-size: 12px;
+}
+
+.replayShowdownTable > span:nth-child(-n + 6) {
+  color: #e2b750;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.replayShowdownTable > strong,
+.replayShowdownTable > b {
+  color: #edf4ff;
+}
+
+.replayShowdownTable > small {
+  color: #cdd6e1;
+  white-space: nowrap;
+}
+
 .showdownHands {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+}
+
+.showdownMatrix {
+  --showdown-columns: 1;
+  display: grid;
+  grid-template-columns: 82px repeat(var(--showdown-columns), minmax(118px, 1fr));
+  gap: 6px;
+  align-items: center;
+  overflow-x: auto;
+  padding: 8px;
+  border-radius: 8px;
+  background: #0e1620;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.showdownMatrix > small {
+  color: #e2b750;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.showdownMatrix > div {
+  min-width: 0;
+  color: #d8e2ef;
+  font-size: 12px;
+}
+
+.showdownMatrix > div > strong,
+.showdownMatrix > div > b {
+  color: #edf4ff;
+}
+
+.showdownMatrix .matrixWinnerCell {
+  background: rgba(88, 214, 141, 0.12);
+  border: 1px solid rgba(88, 214, 141, 0.28);
+  border-radius: 7px;
+  padding: 4px;
+}
+
+.showdownMatrix .matrixWinText {
+  color: #58d68d;
+  font-weight: 1000;
+}
+
+.showdownMatrixBoard {
+  grid-column: span var(--showdown-columns);
+  display: grid;
+  gap: 6px;
 }
 
 .showdownHand {

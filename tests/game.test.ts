@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GameStore, act, approveBuyIn, autoTimeout, buyIn, drawRevealDecision, drawSelect, joinRoom, privateState, publicState, requestBuyIn, sit, sitRandom, stand, startHand, transferHost } from "../server/game";
+import { GameStore, act, approveBuyIn, autoStandBrokePlayers, autoTimeout, buyIn, drawRevealDecision, drawSelect, joinRoom, privateState, publicState, requestBuyIn, sit, sitRandom, stand, startHand, transferHost } from "../server/game";
 import type { Card } from "../shared/types";
 
 function c(text: string): Card {
@@ -65,7 +65,7 @@ describe("game flow", () => {
 
   it("reveals one-card draw publicly and supports reject to dark card", () => {
     const store = new GameStore();
-    const room = store.createRoom("host", "Host", { ante: 10 });
+    const room = store.createRoom("host", "Host", { ante: 10, minBuyIn: 20 });
     joinRoom(room, "p2", "P2");
     sit(room, "host", 0);
     sit(room, "p2", 1);
@@ -285,6 +285,71 @@ describe("game flow", () => {
 
     expect(room.seats[0].drawCount).toBe(0);
     expect(room.hand!.street).toBe("turnBet");
+  });
+
+  it("lets all-in players draw after betting is complete", () => {
+    const store = new GameStore();
+    const room = store.createRoom("host", "Host", { ante: 10, minBuyIn: 20 });
+    joinRoom(room, "p2", "P2");
+    sit(room, "host", 0);
+    sit(room, "p2", 1);
+    buyIn(room, "host", 1000);
+    buyIn(room, "p2", 20);
+    startHand(room, "host");
+
+    act(room, "p2", { type: "all-in" });
+    act(room, "host", { type: "call" });
+
+    expect(room.hand!.street).toBe("flopDraw");
+    expect(room.hand!.currentSeat).toBe(1);
+    expect(privateState(room, "p2")?.drawRequired).toBe(true);
+    drawSelect(room, "p2", []);
+    expect(room.hand!.currentSeat).toBe(0);
+  });
+
+  it("skips later betting rounds when opponents have no chips", () => {
+    const store = new GameStore();
+    const room = store.createRoom("host", "Host", { ante: 10, minBuyIn: 20 });
+    joinRoom(room, "p2", "P2");
+    sit(room, "host", 0);
+    sit(room, "p2", 1);
+    buyIn(room, "host", 1000);
+    buyIn(room, "p2", 20);
+    startHand(room, "host");
+
+    act(room, "p2", { type: "all-in" });
+    act(room, "host", { type: "call" });
+    drawSelect(room, "p2", []);
+    drawSelect(room, "host", []);
+
+    expect(room.hand!.street).toBe("turnDraw");
+    expect(room.hand!.currentSeat).toBe(1);
+    drawSelect(room, "p2", []);
+    drawSelect(room, "host", []);
+
+    expect(room.hand!.street).toBe("settled");
+  });
+
+  it("does not deal to broke players and auto-stands them after 120 seconds", () => {
+    const store = new GameStore();
+    const room = store.createRoom("host", "Host", { ante: 10 });
+    joinRoom(room, "p2", "P2");
+    joinRoom(room, "p3", "P3");
+    sit(room, "host", 0);
+    sit(room, "p2", 1);
+    sit(room, "p3", 2);
+    buyIn(room, "host", 1000);
+    buyIn(room, "p2", 1000);
+    buyIn(room, "p3", 500);
+    room.seats[2].stack = 0;
+
+    startHand(room, "host");
+
+    expect(room.seats[2].hand).toHaveLength(0);
+    room.hand!.street = "settled";
+    expect(autoStandBrokePlayers(room, Date.now())).toBe(false);
+    expect(autoStandBrokePlayers(room, Date.now() + 121_000)).toBe(true);
+    expect(room.seats[2].playerId).toBeNull();
   });
 
   it("takes rake from pots with a per-hand cap", () => {

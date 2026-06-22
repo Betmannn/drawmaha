@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
 import {
   act,
+  autoStandBrokePlayers,
   approveBuyIn,
   autoTimeout,
   drawRevealDecision,
@@ -12,6 +13,7 @@ import {
   GameStore,
   hostStand,
   joinRoom,
+  leaveRoom,
   pauseGame,
   privateState,
   publicState,
@@ -329,9 +331,13 @@ io.on("connection", (socket) => {
 
   socket.on("leaveRoom", async (payload: { roomId: string }, ack?: Ack) => {
     try {
-      await socket.leave(payload.roomId);
+      const playerId = socket.data.playerId as string | undefined;
+      const room = store.getRoom(payload.roomId);
+      if (playerId) leaveRoom(room, playerId);
+      await socket.leave(room.id);
       ok(ack);
-      await broadcastRoomAndSchedule(payload.roomId);
+      socket.emit("roomLeft", { roomId: room.id });
+      await broadcastRoomAndSchedule(room.id);
     } catch (error) {
       fail(ack, error);
     }
@@ -353,7 +359,8 @@ setInterval(async () => {
   for (const room of store.rooms.values()) {
     const before = room.hand?.currentSeat;
     autoTimeout(room);
-    if (before !== room.hand?.currentSeat) await broadcastRoomAndSchedule(room.id);
+    const stood = autoStandBrokePlayers(room);
+    if (before !== room.hand?.currentSeat || stood) await broadcastRoomAndSchedule(room.id);
   }
 }, 500);
 

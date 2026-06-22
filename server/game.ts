@@ -47,6 +47,7 @@ interface SeatState {
   currentBet: number;
   totalContribution: number;
   pendingBuyIn: number;
+  noChipsSince: number | null;
   rakePaid: number;
   lastAction: string | null;
   acted: boolean;
@@ -120,6 +121,7 @@ function createSeat(index: number): SeatState {
     currentBet: 0,
     totalContribution: 0,
     pendingBuyIn: 0,
+    noChipsSince: null,
     rakePaid: 0,
     lastAction: null,
     acted: false,
@@ -254,6 +256,14 @@ export function stand(room: RoomState, playerId: string): void {
   participant.role = participant.id === room.hostId ? "host" : "spectator";
 }
 
+export function leaveRoom(room: RoomState, playerId: string): void {
+  const participant = requireParticipant(room, playerId);
+  if (room.hostId === playerId) transferHostIfNeeded(room, playerId);
+  if (participant.seatIndex !== null) stand(room, playerId);
+  participant.role = participant.id === room.hostId ? "host" : "spectator";
+  addReplay(room, "leave", `${participant.nickname} 退出房间`);
+}
+
 export function hostStand(room: RoomState, hostId: string, targetPlayerId: string): void {
   requireHost(room, hostId);
   if (hostId === targetPlayerId) throw new Error("房主请使用离桌按钮");
@@ -284,6 +294,7 @@ export function buyIn(room: RoomState, playerId: string, amount: number): void {
     addReplay(room, "buyIn", `${participant.nickname} 买入 ${cleanAmount}，下局生效`);
   } else {
     seat.stack += cleanAmount;
+    seat.noChipsSince = null;
     addReplay(room, "buyIn", `${participant.nickname} 买入 ${cleanAmount}`);
   }
 }
@@ -474,6 +485,7 @@ function applyPendingBuyIns(room: RoomState): void {
   for (const seat of room.seats) {
     if (seat.pendingBuyIn > 0) {
       seat.stack += seat.pendingBuyIn;
+      seat.noChipsSince = null;
       addReplay(room, "buyInApplied", `${seat.nickname ?? "玩家"} 下局积分 ${seat.pendingBuyIn} 已生效`);
       seat.pendingBuyIn = 0;
     }
@@ -667,6 +679,26 @@ export function autoTimeout(room: RoomState): void {
   }
 }
 
+export function autoStandBrokePlayers(room: RoomState, now = Date.now()): boolean {
+  if (room.hand && room.hand.street !== "settled") return false;
+  let changed = false;
+  for (const seat of [...room.seats]) {
+    if (!seat.playerId || seat.pendingBuyIn > 0) continue;
+    if (seat.stack > 0) {
+      seat.noChipsSince = null;
+      continue;
+    }
+    seat.noChipsSince ??= now;
+    if (now - seat.noChipsSince < 120_000) continue;
+    if (room.hostId === seat.playerId) transferHostIfNeeded(room, seat.playerId);
+    const nickname = seat.nickname ?? "玩家";
+    stand(room, seat.playerId);
+    addReplay(room, "autoStand", `${nickname} 0 分超过 120 秒，自动起立`);
+    changed = true;
+  }
+  return changed;
+}
+
 export function publicState(room: RoomState, viewerId: string): PublicRoomState {
   const participant = room.participants.get(viewerId);
   const viewerRole = participant?.role ?? "spectator";
@@ -744,6 +776,12 @@ function beginBettingRound(room: RoomState, street: Street): void {
     seat.acted = seat.folded || seat.allIn;
     seat.lastAction = seat.folded || seat.lastAction === "要第一张" || seat.lastAction === "不要第一张" ? seat.lastAction : null;
   }
+  if (bettingComplete(room)) {
+    hand.currentSeat = null;
+    hand.timerEndsAt = null;
+    advanceStreet(room);
+    return;
+  }
   hand.currentSeat = nextActionSeat(room, room.dealerSeat ?? -1);
   resetTimer(room);
   if (hand.currentSeat === null) advanceStreet(room);
@@ -753,7 +791,7 @@ function beginDrawRound(room: RoomState, street: Street): void {
   const hand = requireHand(room);
   hand.street = street;
   for (const seat of room.seats) {
-    seat.acted = seat.folded || seat.allIn;
+    seat.acted = seat.folded || !seat.playerId || seat.hand.length === 0;
     seat.pendingDraw = null;
     seat.drawCount = seat.folded ? seat.drawCount : null;
   }
@@ -1029,6 +1067,7 @@ function splitAward(amount: number, winners: SeatState[]): void {
   let remainder = amount - share * winners.length;
   for (const winner of winners) {
     winner.stack += share + (remainder > 0 ? 1 : 0);
+    if (winner.stack > 0) winner.noChipsSince = null;
     remainder -= 1;
   }
 }
@@ -1054,10 +1093,24 @@ function hasOtherHostCandidates(room: RoomState, playerId: string): boolean {
   return room.seats.some((seat) => seat.playerId && seat.playerId !== playerId);
 }
 
+function transferHostIfNeeded(room: RoomState, playerId: string): void {
+  if (room.hostId !== playerId) return;
+  const target = room.seats.find((seat) => seat.playerId && seat.playerId !== playerId);
+  if (!target?.playerId) return;
+  const oldHost = requireParticipant(room, playerId);
+  const nextHost = requireParticipant(room, target.playerId);
+  room.hostId = nextHost.id;
+  oldHost.role = oldHost.seatIndex === null ? "spectator" : "player";
+  nextHost.role = "host";
+  addReplay(room, "host", `${oldHost.nickname} 退出前将房主转交给 ${nextHost.nickname}`);
+}
+
 function bettingComplete(room: RoomState): boolean {
   const open = room.seats.filter((seat) => !seat.folded && !seat.allIn);
-  if (open.length <= 1) return true;
-  return open.every((seat) => seat.acted && seat.currentBet === requireHand(room).currentBet);
+  const currentBet = requireHand(room).currentBet;
+  if (open.length === 0) return true;
+  if (open.length === 1) return open[0].currentBet === currentBet;
+  return open.every((seat) => seat.acted && seat.currentBet === currentBet);
 }
 
 function nextDealerSeat(room: RoomState, activeSeats: SeatState[]): number {
@@ -1083,7 +1136,7 @@ function nextDrawSeat(room: RoomState, from: number): number | null {
   for (let offset = 1; offset <= room.seats.length; offset += 1) {
     const index = (from + offset + room.seats.length) % room.seats.length;
     const seat = room.seats[index];
-    if (!seat.folded && !seat.allIn && seat.playerId && !seat.acted) return index;
+    if (!seat.folded && seat.playerId && seat.hand.length > 0 && !seat.acted) return index;
   }
   return null;
 }
@@ -1101,7 +1154,10 @@ function postChips(seat: SeatState, amount: number): void {
   seat.stack -= paid;
   seat.currentBet += paid;
   seat.totalContribution += paid;
-  if (seat.stack === 0) seat.allIn = true;
+  if (seat.stack === 0) {
+    seat.allIn = true;
+    seat.noChipsSince ??= Date.now();
+  }
 }
 
 function callAmount(seat: SeatState, amount: number): void {

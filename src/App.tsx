@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent, ReactNode } from "react";
 import { Fragment } from "react";
 import { io, Socket } from "socket.io-client";
@@ -85,6 +85,7 @@ export function App() {
   const [settings, setSettings] = useState<RoomSettings>(defaultSettings);
   const [openPanel, setOpenPanel] = useState<UtilityPanel>(null);
   const [closedShowdownKey, setClosedShowdownKey] = useState<string | null>(null);
+  const [settlementSnapshot, setSettlementSnapshot] = useState<{ room: PublicRoomState; expiresAt: number } | null>(null);
   const [seenChat, setSeenChat] = useState<{ roomId: string | null; count: number }>({ roomId: null, count: 0 });
   const [restoreAttempted, setRestoreAttempted] = useState(false);
 
@@ -94,12 +95,21 @@ export function App() {
     socket.on("connect", () => setError(null));
     socket.on("disconnect", () => setError("连接已断开，正在等待重连"));
     socket.on("chatMessage", (_message: ChatMessage) => undefined);
+    socket.on("roomLeft", () => {
+      clearRoomSession();
+      setRoom(null);
+      setPrivateState(null);
+      setOpenPanel(null);
+      setClosedShowdownKey(null);
+      setSettlementSnapshot(null);
+    });
     return () => {
       socket.off("roomState");
       socket.off("privateState");
       socket.off("connect");
       socket.off("disconnect");
       socket.off("chatMessage");
+      socket.off("roomLeft");
     };
   }, []);
 
@@ -112,6 +122,18 @@ export function App() {
       return current;
     });
   }, [room?.roomId, room?.chat.length, openPanel]);
+
+  const activeShowdownKey = room?.showdown ? showdownKey(room) : "";
+  useEffect(() => {
+    if (!room?.showdown) return;
+    const key = showdownKey(room);
+    setSettlementSnapshot({ room, expiresAt: Date.now() + 30_000 });
+    const timer = window.setTimeout(() => {
+      setSettlementSnapshot((current) => current && showdownKey(current.room) === key ? null : current);
+      setClosedShowdownKey((current) => current === key ? current : key);
+    }, 30_000);
+    return () => window.clearTimeout(timer);
+  }, [activeShowdownKey]);
 
   async function run<T>(fn: () => Promise<T>) {
     try {
@@ -181,6 +203,20 @@ export function App() {
     );
     if (result !== undefined) {
       saveRoomSession({ roomId: roomIdInput.trim().toUpperCase(), nickname: joinNickname.trim(), asSpectator });
+    }
+  }
+
+  async function leaveCurrentRoom() {
+    if (!room) return;
+    const leftRoomId = room.roomId;
+    const failed = await run(() => emit("leaveRoom", { roomId: leftRoomId }).then(() => false));
+    if (failed === false) {
+      clearRoomSession();
+      setRoom(null);
+      setPrivateState(null);
+      setOpenPanel(null);
+      setClosedShowdownKey(null);
+      setRoomIdInput(leftRoomId);
     }
   }
 
@@ -267,11 +303,12 @@ export function App() {
   }
 
   const hasUnreadChat = seenChat.roomId === room.roomId && room.chat.length > seenChat.count && openPanel !== "chat";
+  const showdownRoom = room.showdown ? room : settlementSnapshot?.room ?? null;
 
   return (
     <main className="appShell">
       <Header room={room} error={error} />
-      <UtilityDock room={room} openPanel={openPanel} setOpenPanel={setOpenPanel} hasUnreadChat={hasUnreadChat} />
+      <UtilityDock room={room} openPanel={openPanel} setOpenPanel={setOpenPanel} hasUnreadChat={hasUnreadChat} onLeave={leaveCurrentRoom} />
       <PokerTable room={room} privateState={privateState} run={run} />
       <ActionPanel room={room} privateState={privateState} run={run} />
       <UtilityModal panel={openPanel} setPanel={setOpenPanel}>
@@ -280,7 +317,16 @@ export function App() {
         {openPanel === "chat" && <Chat room={room} run={run} />}
         {openPanel === "replay" && <Replay room={room} />}
       </UtilityModal>
-      <ShowdownModal room={room} closedKey={closedShowdownKey} setClosedKey={setClosedShowdownKey} />
+      {showdownRoom && (
+        <ShowdownModal
+          room={showdownRoom}
+          closedKey={closedShowdownKey}
+          onClose={(key) => {
+            setClosedShowdownKey(key);
+            setSettlementSnapshot((current) => current && showdownKey(current.room) === key ? null : current);
+          }}
+        />
+      )}
       {privateState?.pendingDrawReveal && <DrawRevealModal room={room} card={privateState.pendingDrawReveal} run={run} />}
     </main>
   );
@@ -315,12 +361,14 @@ function UtilityDock({
   room,
   openPanel,
   setOpenPanel,
-  hasUnreadChat
+  hasUnreadChat,
+  onLeave
 }: {
   room: PublicRoomState;
   openPanel: UtilityPanel;
   setOpenPanel: (panel: UtilityPanel) => void;
   hasUnreadChat: boolean;
+  onLeave: () => Promise<void>;
 }) {
   const hasPendingBuyIns = room.viewerId === room.hostId && room.pendingBuyIns.length > 0;
   const buttons: Array<{ panel: Exclude<UtilityPanel, null>; label: string; icon: ReactNode }> = [
@@ -342,6 +390,10 @@ function UtilityDock({
           <span>{button.label}</span>
         </button>
       ))}
+      <button className="leaveRoomButton" aria-label="退出房间" onClick={onLeave}>
+        <X size={16} />
+        <span>退出</span>
+      </button>
     </nav>
   );
 }
@@ -510,11 +562,11 @@ function DrawDecisionNotice({ room }: { room: PublicRoomState }) {
   const [visibleId, setVisibleId] = useState<string | null>(null);
   useEffect(() => {
     if (!latest) return;
-    const payload = latest.payload as { playerId?: string } | undefined;
+    const payload = latest.payload as { playerId?: string; accept?: boolean } | undefined;
     if (payload?.playerId === room.viewerId) return;
     if (Date.now() - latest.at > 6000) return;
     setVisibleId(latest.id);
-    const timer = window.setTimeout(() => setVisibleId(null), 3600);
+    const timer = window.setTimeout(() => setVisibleId(null), payload?.accept === false ? 2000 : 3600);
     return () => window.clearTimeout(timer);
   }, [latest?.id, latest?.at, latest?.payload, room.viewerId]);
   if (!latest || visibleId !== latest.id) return null;
@@ -916,10 +968,16 @@ function escapeHtml(value: string): string {
 
 function Chat({ room, run }: { room: PublicRoomState; run: <T>(fn: () => Promise<T>) => Promise<T | undefined> }) {
   const [text, setText] = useState("");
+  const messagesRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const node = messagesRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [room.chat.length]);
   return (
     <section className="panel chatPanel">
       <h3><MessageSquare size={16} /> 聊天</h3>
-      <div className="messages">
+      <div className="messages" ref={messagesRef}>
         {room.chat.map((message) => (
           <button className="chatMessage" type="button" key={message.id} onClick={() => setText(message.text)} title="点击复制到输入框">
             <strong>{message.nickname}</strong>：{message.text}
@@ -945,26 +1003,15 @@ function Chat({ room, run }: { room: PublicRoomState; run: <T>(fn: () => Promise
 }
 
 function Replay({ room }: { room: PublicRoomState }) {
-  const [index, setIndex] = useState(0);
-  const visible = room.replay.slice(0, index + 1);
-  useEffect(() => setIndex(Math.max(0, room.replay.length - 1)), [room.replay.length]);
+  const hands = useMemo(() => replayHands(room.replay), [room.replay]);
   return (
     <section className="panel replayPanel">
       <div className="panelTitleRow">
         <h3><History size={16} /> 手牌回放</h3>
         <button onClick={() => exportReplayPdf(room)}>导出 PDF</button>
       </div>
-      <div className="buttonRow">
-        <button onClick={() => setIndex(Math.max(0, index - 1))}>上一步</button>
-        <button onClick={() => setIndex(Math.min(room.replay.length - 1, index + 1))}>下一步</button>
-      </div>
       <div className="messages">
-        {visible.map((event) => (
-          <div className="replayEvent" key={event.id}>
-            <p>{event.message}</p>
-            <ReplayPayload event={event} room={room} />
-          </div>
-        ))}
+        {hands.length ? hands.map((hand, reverseIndex) => <ReplayHandCard key={hand.id} hand={hand} room={room} number={hands.length - reverseIndex} />) : <p>暂无回放记录</p>}
       </div>
       {room.showdown && (
         <div className="showdown">
@@ -977,9 +1024,148 @@ function Replay({ room }: { room: PublicRoomState }) {
   );
 }
 
+type ReplayHand = {
+  id: string;
+  startedAt: number;
+  events: PublicRoomState["replay"];
+};
+
+const replayLineTypes = new Set(["act", "draw", "drawRevealShown", "drawReveal", "turn", "river", "stand", "autoStand", "settled"]);
+
+function replayHands(events: PublicRoomState["replay"]): ReplayHand[] {
+  const hands: ReplayHand[] = [];
+  let current: ReplayHand | null = null;
+  for (const event of events) {
+    if (event.type === "handStarted") {
+      current = { id: event.id, startedAt: event.at, events: [event] };
+      hands.push(current);
+      continue;
+    }
+    if (current) current.events.push(event);
+  }
+  return hands.reverse();
+}
+
+function ReplayHandCard({ hand, room, number }: { hand: ReplayHand; room: PublicRoomState; number: number }) {
+  const settled = [...hand.events].reverse().find((event) => event.type === "settled");
+  const settledPayload = settled?.payload as ReplayPayloadData | undefined;
+  const boardPayload = settledPayload?.board ?? [...hand.events].reverse().map((event) => (event.payload as ReplayPayloadData | undefined)?.board).find(Boolean);
+  const lines = hand.events.filter((event) => replayLineTypes.has(event.type)).reverse();
+  return (
+    <article className="replayHandCard">
+      <div className="replayHandHeader">
+        <strong>第 {number} 手</strong>
+        <small>{new Date(hand.startedAt).toLocaleString()}</small>
+      </div>
+      {settledPayload?.shownHands?.length && <ReplayShowdownTable payload={settledPayload} />}
+      {boardPayload && (
+        <div className="replayBoardCards">
+          <ReplayBoardRow title="Board A" cards={boardPayload.top ?? []} />
+          <ReplayBoardRow title="Board B" cards={boardPayload.bottom ?? []} />
+        </div>
+      )}
+      {settledPayload?.playerResults && <SettlementTable results={settledPayload.playerResults} />}
+      {settledPayload?.potAwards?.length && (
+        <div className="replayAwards">
+          {settledPayload.potAwards.map((award, index) => (
+            <small key={index}>底池 {index + 1}: {award.amount} → {award.winners.map((id) => playerName(room, id)).join("、")}</small>
+          ))}
+        </div>
+      )}
+      <div className="replayActionLine">
+        {lines.map((event) => (
+          <ReplayEventLine key={event.id} event={event} />
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function ReplayShowdownTable({ payload }: { payload: ReplayPayloadData }) {
+  if (!payload.shownHands?.length) return null;
+  const boardDescriptions = new Map<string, Record<string, string>>();
+  for (const board of payload.boards ?? []) boardDescriptions.set(board.board, board.descriptions);
+  return (
+    <div className="replayShowdownTable">
+      <span>玩家</span>
+      <span>手牌</span>
+      <span>得分</span>
+      <span>Board A</span>
+      <span>Board B</span>
+      <span>手牌 Board</span>
+      {payload.shownHands.map((shown) => (
+        <Fragment key={shown.playerId}>
+          <strong>{shown.nickname}</strong>
+          <div className="miniShowCards">
+            {shown.cards.map((card, index) => <CardView key={index} card={card} small />)}
+          </div>
+          <b>{payload.points?.[shown.playerId] ?? 0}</b>
+          <small>{shortHandDescription(boardDescriptions.get("top")?.[shown.playerId] ?? "-")}</small>
+          <small>{shortHandDescription(boardDescriptions.get("bottom")?.[shown.playerId] ?? "-")}</small>
+          <small>{shortHandDescription(boardDescriptions.get("hand")?.[shown.playerId] ?? "-")}</small>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+function ReplayEventLine({ event }: { event: PublicRoomState["replay"][number] }) {
+  const groups = replayEventCardGroups(event);
+  return (
+    <div className="replayEvent">
+      <small>{new Date(event.at).toLocaleTimeString()}</small>
+      <p>{replayEventMessage(event)}</p>
+      {groups.map((group) => (
+        <div className="replayEventCards" key={group.label}>
+          <span>{group.label}</span>
+          <div className="miniShowCards">
+            {group.cards.map((card, index) => <CardView key={`${group.label}-${index}`} card={card} small />)}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function replayEventMessage(event: PublicRoomState["replay"][number]): string {
+  if (event.type === "turn") return "Turn 发出";
+  if (event.type === "river") return "River 发出";
+  if (event.type === "drawRevealShown") return event.message.replace(/\s+[2-9TJQKA][shdc](?=，|,|$)/g, "");
+  return event.message.replace(/\s+[2-9TJQKA][shdc](?=\s|\/|，|,|$)/g, "");
+}
+
+function replayEventCardGroups(event: PublicRoomState["replay"][number]): Array<{ label: string; cards: Card[] }> {
+  const payload = event.payload as ReplayPayloadData | undefined;
+  if (!payload) return [];
+  if ((event.type === "turn" || event.type === "river") && payload.board) {
+    const index = event.type === "turn" ? 3 : 4;
+    return [
+      { label: "Board A", cards: payload.board.top?.[index] ? [payload.board.top[index]] : [] },
+      { label: "Board B", cards: payload.board.bottom?.[index] ? [payload.board.bottom[index]] : [] }
+    ].filter((group) => group.cards.length > 0);
+  }
+  if (event.type === "drawRevealShown" && payload.card) return [{ label: "明牌", cards: [payload.card] }];
+  if (event.type === "drawReveal" && payload.reveal) return [{ label: "第一张明牌", cards: [payload.reveal] }];
+  return [];
+}
+
+function ReplayBoardRow({ title, cards }: { title: string; cards: Card[] }) {
+  return (
+    <div className="replayBoardRow">
+      <strong>{title}</strong>
+      <div className="miniShowCards">
+        {Array.from({ length: 5 }, (_, index) => <CardView key={index} card={cards[index] ?? "back"} small />)}
+      </div>
+    </div>
+  );
+}
+
 type ReplayPayloadData = {
   board?: { top?: Card[]; bottom?: Card[] };
   boards?: ShowdownBoardResult[];
+  card?: Card;
+  reveal?: Card;
+  discarded?: Card;
   pot?: number;
   rakeTotal?: number;
   playerResults?: PlayerSettlement[];
@@ -1008,12 +1194,7 @@ function ReplayPayload({ event, room }: { event: PublicRoomState["replay"][numbe
                 <div className="miniShowCards">
                   {shown.cards.map((card, index) => <CardView key={index} card={card} small />)}
                 </div>
-                {payload.board && (
-                  <div className="replayBoardCompare">
-                    <small>A {payload.board.top?.map(cardToString).join(" ") || "-"}</small>
-                    <small>B {payload.board.bottom?.map(cardToString).join(" ") || "-"}</small>
-                  </div>
-                )}
+                {payload.board && <ReplayBoardCards board={payload.board} />}
               </div>
             ))}
           </div>
@@ -1028,28 +1209,27 @@ function ReplayPayload({ event, room }: { event: PublicRoomState["replay"][numbe
   }
   if (payload.board) {
     return (
-      <small>
-        A: {payload.board.top?.map(cardToString).join(" ") || "-"} / B: {payload.board.bottom?.map(cardToString).join(" ") || "-"}
-        {typeof payload.pot === "number" ? ` / Pot ${payload.pot}` : ""}
-      </small>
+      <div className="settlementReplay">
+        <ReplayBoardCards board={payload.board} />
+        {typeof payload.pot === "number" ? <small>Pot {payload.pot}</small> : null}
+      </div>
     );
   }
   return null;
 }
 
+function ReplayBoardCards({ board }: { board: { top?: Card[]; bottom?: Card[] } }) {
+  return (
+    <div className="replayBoardCompare">
+      <ReplayBoardRow title="Board A" cards={board.top ?? []} />
+      <ReplayBoardRow title="Board B" cards={board.bottom ?? []} />
+    </div>
+  );
+}
+
 function exportReplayPdf(room: PublicRoomState): void {
-  const rows = room.replay.map((event, index) => {
-    const payload = event.payload as ReplayPayloadData | undefined;
-    return `
-      <section class="event">
-        <div class="eventTitle">
-          <strong>${index + 1}. ${escapeHtml(event.message)}</strong>
-          <span>${new Date(event.at).toLocaleString()}</span>
-        </div>
-        ${replayPayloadHtml(payload, room)}
-      </section>
-    `;
-  }).join("");
+  const hands = replayHands(room.replay);
+  const rows = hands.map((hand, reverseIndex) => replayHandHtml(hand, room, hands.length - reverseIndex)).join("");
   const html = `<!doctype html>
     <html lang="zh-CN">
       <head>
@@ -1059,15 +1239,33 @@ function exportReplayPdf(room: PublicRoomState): void {
           body { margin: 24px; color: #111827; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
           h1 { margin: 0 0 6px; font-size: 22px; }
           .meta { margin: 0 0 18px; color: #4b5563; font-size: 12px; }
-          .event { break-inside: avoid; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+          .hand { break-inside: avoid; border: 1px solid #d1d5db; border-radius: 10px; padding: 12px; margin-bottom: 16px; display: grid; gap: 10px; }
+          .handTitle { display: flex; justify-content: space-between; gap: 12px; color: #111827; padding-bottom: 8px; border-bottom: 1px solid #e5e7eb; }
+          .handTitle span, small { color: #6b7280; font-size: 11px; }
+          .actionLine { display: grid; gap: 4px; padding: 8px; border-radius: 8px; background: #f8fafc; }
+          .event { display: grid; gap: 3px; padding: 6px 0; border-bottom: 1px solid #e5e7eb; }
+          .event:last-child { border-bottom: 0; }
           .eventTitle { display: flex; justify-content: space-between; gap: 12px; color: #111827; }
           .eventTitle span, small { color: #6b7280; font-size: 11px; }
           .grid { display: grid; gap: 6px; margin-top: 8px; }
+          .cardLine { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+          .cardLine b { min-width: 58px; font-size: 11px; color: #374151; }
+          .cards { display: flex; gap: 4px; flex-wrap: wrap; }
+          .pdfCard { width: 28px; height: 40px; border: 1px solid #cbd5e1; border-radius: 5px; background: #fff; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; font-weight: 900; line-height: 1; }
+          .pdfCard .rank { font-size: 12px; }
+          .pdfCard .suit { font-size: 16px; }
+          .pdfCard.suit-s { color: #111827; }
+          .pdfCard.suit-h { color: #c81e1e; }
+          .pdfCard.suit-d { color: #1d6fd8; }
+          .pdfCard.suit-c { color: #11834a; }
           .shownHands { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
           .cardBox { border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px; }
           .boardStrengths { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
           .boardStrengthBlock { border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px; display: grid; gap: 4px; }
           .boardStrengthBlock small { display: flex; justify-content: space-between; gap: 8px; }
+          .replayShowdown { display: grid; grid-template-columns: 0.8fr 1.7fr 0.45fr repeat(3, 0.8fr); gap: 5px 8px; align-items: center; padding: 8px; border: 1px solid #d1d5db; border-radius: 8px; }
+          .replayShowdown small { font-weight: 700; color: #374151; }
+          .replayShowdown b { color: #111827; }
           .settlement { display: grid; grid-template-columns: 1.2fr repeat(4, auto); gap: 4px 8px; align-items: center; font-size: 12px; }
           .settlement b { color: #111827; }
           .positive { color: #047857; }
@@ -1077,7 +1275,7 @@ function exportReplayPdf(room: PublicRoomState): void {
       </head>
       <body>
         <h1>${escapeHtml(room.settings.tableName)} 手牌回放</h1>
-        <p class="meta">房间 ${escapeHtml(room.roomId)} · 导出 ${new Date().toLocaleString()} · 事件 ${room.replay.length} 条</p>
+        <p class="meta">房间 ${escapeHtml(room.roomId)} · 导出 ${new Date().toLocaleString()} · 手牌 ${hands.length} 手</p>
         ${rows || "<p>暂无回放记录</p>"}
         <script>setTimeout(() => window.print(), 250);</script>
       </body>
@@ -1095,14 +1293,7 @@ function exportReplayPdf(room: PublicRoomState): void {
 function replayPayloadHtml(payload: ReplayPayloadData | undefined, room: PublicRoomState): string {
   if (!payload) return "";
   if (payload.playerResults) {
-    const boardStrengths = boardStrengthsHtml(payload.boards, room);
-    const shown = payload.shownHands?.map((hand) => `
-      <div class="cardBox">
-        <b>${escapeHtml(hand.nickname)}</b>
-        <div>手牌：${escapeHtml(hand.cards.map(cardToString).join(" "))}</div>
-        ${payload.board ? `<small>A：${escapeHtml(payload.board.top?.map(cardToString).join(" ") || "-")}</small><br /><small>B：${escapeHtml(payload.board.bottom?.map(cardToString).join(" ") || "-")}</small>` : ""}
-      </div>
-    `).join("") ?? "";
+    const shown = replayShowdownTableHtml(payload);
     const settlements = payload.playerResults.map((result) => `
       <b>${escapeHtml(result.nickname)}${result.folded ? " 弃牌" : ""}</b>
       <span>${result.points}</span>
@@ -1113,16 +1304,94 @@ function replayPayloadHtml(payload: ReplayPayloadData | undefined, room: PublicR
     const awards = payload.potAwards?.map((award, index) => `<small>底池 ${index + 1}: ${award.amount} -> ${escapeHtml(award.winners.map((id) => playerName(room, id)).join("、"))}</small>`).join("<br />") ?? "";
     return `<div class="grid">
       <small>Pot ${payload.pot ?? room.pot}</small>
-      ${shown ? `<div class="shownHands">${shown}</div>` : ""}
-      ${boardStrengths}
+      ${shown}
       <div class="settlement"><small>玩家</small><small>得分</small><small>投入</small><small>分回</small><small>净输赢</small>${settlements}</div>
       ${awards}
     </div>`;
   }
   if (payload.board) {
-    return `<div class="grid"><small>A: ${escapeHtml(payload.board.top?.map(cardToString).join(" ") || "-")} / B: ${escapeHtml(payload.board.bottom?.map(cardToString).join(" ") || "-")}${typeof payload.pot === "number" ? ` / Pot ${payload.pot}` : ""}</small></div>`;
+    return `<div class="grid">${boardHtml(payload.board)}${typeof payload.pot === "number" ? `<small>Pot ${payload.pot}</small>` : ""}</div>`;
   }
   return "";
+}
+
+function replayHandHtml(hand: ReplayHand, room: PublicRoomState, number: number): string {
+  const settled = [...hand.events].reverse().find((event) => event.type === "settled");
+  const settledPayload = settled?.payload as ReplayPayloadData | undefined;
+  const boardPayload = settledPayload?.board ?? [...hand.events].reverse().map((event) => (event.payload as ReplayPayloadData | undefined)?.board).find(Boolean);
+  const lines = hand.events.filter((event) => replayLineTypes.has(event.type)).reverse();
+  const awards = settledPayload?.potAwards?.map((award, index) => `<small>底池 ${index + 1}: ${award.amount} -> ${escapeHtml(award.winners.map((id) => playerName(room, id)).join("、"))}</small>`).join("<br />") ?? "";
+  return `
+    <section class="hand">
+      <div class="handTitle">
+        <strong>第 ${number} 手</strong>
+        <span>${new Date(hand.startedAt).toLocaleString()}</span>
+      </div>
+      ${settledPayload ? replayShowdownTableHtml(settledPayload) : ""}
+      ${boardPayload ? boardHtml(boardPayload) : ""}
+      ${settledPayload?.playerResults ? settlementHtml(settledPayload.playerResults) : ""}
+      ${awards}
+      <div class="actionLine">
+        ${lines.map((event) => `
+          <div class="event">
+            <div class="eventTitle">
+              <strong>${escapeHtml(replayEventMessage(event))}</strong>
+              <span>${new Date(event.at).toLocaleTimeString()}</span>
+            </div>
+            ${replayEventCardsHtml(event)}
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function replayEventCardsHtml(event: PublicRoomState["replay"][number]): string {
+  const groups = replayEventCardGroups(event);
+  if (!groups.length) return "";
+  return `<div class="grid">${groups.map((group) => `<div class="cardLine"><b>${escapeHtml(group.label)}</b>${cardsHtml(group.cards)}</div>`).join("")}</div>`;
+}
+
+function settlementHtml(results: PlayerSettlement[]): string {
+  const rows = results.map((result) => `
+    <b>${escapeHtml(result.nickname)}${result.folded ? " 弃牌" : ""}</b>
+    <span>${result.points}</span>
+    <span>${result.contribution}</span>
+    <span>${result.awarded}</span>
+    <b class="${result.net >= 0 ? "positive" : "negative"}">${result.net >= 0 ? "+" : ""}${result.net}</b>
+  `).join("");
+  return `<div class="settlement"><small>玩家</small><small>得分</small><small>投入</small><small>分回</small><small>净输赢</small>${rows}</div>`;
+}
+
+function replayShowdownTableHtml(payload: ReplayPayloadData): string {
+  if (!payload.shownHands?.length) return "";
+  const descriptions = new Map<string, Record<string, string>>();
+  for (const board of payload.boards ?? []) descriptions.set(board.board, board.descriptions);
+  const rows = payload.shownHands.map((hand) => `
+    <b>${escapeHtml(hand.nickname)}</b>
+    <span>${cardsHtml(hand.cards)}</span>
+    <span>${payload.points?.[hand.playerId] ?? 0}</span>
+    <span>${escapeHtml(shortHandDescription(descriptions.get("top")?.[hand.playerId] ?? "-"))}</span>
+    <span>${escapeHtml(shortHandDescription(descriptions.get("bottom")?.[hand.playerId] ?? "-"))}</span>
+    <span>${escapeHtml(shortHandDescription(descriptions.get("hand")?.[hand.playerId] ?? "-"))}</span>
+  `).join("");
+  return `<div class="replayShowdown"><small>玩家</small><small>手牌</small><small>得分</small><small>Board A</small><small>Board B</small><small>手牌 Board</small>${rows}</div>`;
+}
+
+function boardHtml(board: { top?: Card[]; bottom?: Card[] }): string {
+  return `
+    <div class="cardLine"><b>Board A</b>${cardsHtml(board.top ?? [])}</div>
+    <div class="cardLine"><b>Board B</b>${cardsHtml(board.bottom ?? [])}</div>
+  `;
+}
+
+function cardsHtml(cards: Card[]): string {
+  if (!cards.length) return "<small>-</small>";
+  return `<span class="cards">${cards.map(cardHtml).join("")}</span>`;
+}
+
+function cardHtml(card: Card): string {
+  return `<span class="pdfCard suit-${card.suit}"><span class="rank">${escapeHtml(card.rank)}</span><span class="suit">${suitSymbol(card.suit)}</span></span>`;
 }
 
 function BoardStrengthSummary({ boards, room }: { boards?: ShowdownBoardResult[]; room: PublicRoomState }) {
@@ -1181,13 +1450,47 @@ function SettlementTable({ results }: { results: PlayerSettlement[] }) {
   );
 }
 
-function ShowdownModal({ room, closedKey, setClosedKey }: { room: PublicRoomState; closedKey: string | null; setClosedKey: (key: string) => void }) {
+function ShowdownModal({ room, closedKey, onClose }: { room: PublicRoomState; closedKey: string | null; onClose: (key: string) => void }) {
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [drag, setDrag] = useState<{ pointerId: number; x: number; y: number; originX: number; originY: number } | null>(null);
+  const key = room.showdown ? showdownKey(room) : "";
+  useEffect(() => {
+    setPosition({ x: 0, y: 0 });
+    setDrag(null);
+  }, [key]);
   if (!room.showdown) return null;
-  const key = showdownKey(room);
   if (closedKey === key) return null;
+
+  function startDrag(event: PointerEvent<HTMLElement>): void {
+    if ((event.target as HTMLElement).closest("button")) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDrag({ pointerId: event.pointerId, x: event.clientX, y: event.clientY, originX: position.x, originY: position.y });
+  }
+
+  function moveDrag(event: PointerEvent<HTMLElement>): void {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    setPosition({
+      x: drag.originX + event.clientX - drag.x,
+      y: drag.originY + event.clientY - drag.y
+    });
+  }
+
+  function stopDrag(event: PointerEvent<HTMLElement>): void {
+    if (drag?.pointerId !== event.pointerId) return;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    setDrag(null);
+  }
+
   return (
-    <section className="settlementBanner">
-      <button className="iconButton closeButton" onClick={() => setClosedKey(key)} aria-label="关闭">
+    <section
+      className="settlementBanner"
+      onPointerDown={startDrag}
+      onPointerMove={moveDrag}
+      onPointerUp={stopDrag}
+      onPointerCancel={stopDrag}
+      style={{ transform: `translate(calc(-50% + ${position.x}px), calc(-50% + ${position.y}px))` }}
+    >
+      <button className="iconButton closeButton" onClick={() => onClose(key)} aria-label="关闭">
         <X size={16} />
       </button>
       <div>
@@ -1208,39 +1511,8 @@ function ShowdownDetails({ room }: { room: PublicRoomState }) {
   if (!room.showdown) return null;
   return (
     <div className="showdownFull">
-      <strong>摊牌手牌</strong>
-      {room.showdown.noShowdown ? <p>其他玩家已弃牌，获胜者无需亮牌。</p> : <div className="showdownHands">
-        {room.seats.filter((seat) => seat.playerId && seat.cards?.length && seat.cards.some((card) => card !== "back")).map((seat) => (
-          <div className="showdownHand" key={seat.playerId ?? seat.index}>
-            <div className="showdownHandTop">
-              <span>{seat.nickname}</span>
-              {seat.playerId && room.showdown?.winnerIds.includes(seat.playerId) && <strong>WIN</strong>}
-            </div>
-            <div className="miniShowCards">
-              {seat.cards?.map((card, index) => <CardView key={index} card={card} small />)}
-            </div>
-          </div>
-        ))}
-      </div>}
-      {!room.showdown.noShowdown && (
-        <>
-          <strong>公共 Board 牌力</strong>
-          <div className="publicBoardCompare">
-            <small>Board A：{room.board.top.map(cardToString).join(" ") || "-"}</small>
-            <small>Board B：{room.board.bottom.map(cardToString).join(" ") || "-"}</small>
-          </div>
-          <BoardStrengthSummary boards={room.showdown.boards} room={room} />
-        </>
-      )}
-      <strong>获胜方牌型</strong>
-      {room.showdown.boards.map((board) => (
-        <div className="boardResult" key={board.board}>
-          <p>{boardName(board.board)}：{board.winners.map((id) => playerName(room, id)).join("、")}</p>
-          {board.winners.map((id) => (
-            <small key={id}>{playerName(room, id)} - {board.descriptions[id]}</small>
-          ))}
-        </div>
-      ))}
+      <strong>摊牌与牌力</strong>
+      {room.showdown.noShowdown ? <p>其他玩家已弃牌，获胜者无需亮牌。</p> : <ShowdownTransposedTable room={room} />}
       <strong>底池分配</strong>
       {room.showdown.potAwards.map((award, i) => (
         <p key={i}>{award.amount} → {award.winners.map((id) => playerName(room, id)).join("、")}</p>
@@ -1251,9 +1523,41 @@ function ShowdownDetails({ room }: { room: PublicRoomState }) {
   );
 }
 
+function ShowdownTransposedTable({ room }: { room: PublicRoomState }) {
+  const showdown = room.showdown;
+  if (!showdown) return null;
+  const shownSeats = room.seats.filter((seat) => seat.playerId && seat.cards?.length && seat.cards.some((card) => card !== "back"));
+  if (!shownSeats.length) return null;
+  const descriptions = new Map<string, Record<string, string>>();
+  for (const board of showdown.boards) descriptions.set(board.board, board.descriptions);
+  const rows = [
+    { label: "玩家", render: (seat: PublicRoomState["seats"][number]) => <strong>{seat.nickname}{seat.playerId && showdown.winnerIds.includes(seat.playerId) ? <span className="matrixWinText"> WIN</span> : null}</strong> },
+    { label: "手牌", render: (seat: PublicRoomState["seats"][number]) => <div className="miniShowCards">{seat.cards?.map((card, index) => <CardView key={index} card={card} small />)}</div> },
+    { label: "得分", render: (seat: PublicRoomState["seats"][number]) => <b>{seat.playerId ? showdown.points[seat.playerId] ?? 0 : 0}</b> },
+    { label: "Board A", render: (seat: PublicRoomState["seats"][number]) => <span>{seat.playerId ? shortHandDescription(descriptions.get("top")?.[seat.playerId] ?? "-") : "-"}</span> },
+    { label: "Board B", render: (seat: PublicRoomState["seats"][number]) => <span>{seat.playerId ? shortHandDescription(descriptions.get("bottom")?.[seat.playerId] ?? "-") : "-"}</span> },
+    { label: "手牌 Board", render: (seat: PublicRoomState["seats"][number]) => <span>{seat.playerId ? shortHandDescription(descriptions.get("hand")?.[seat.playerId] ?? "-") : "-"}</span> }
+  ];
+  return (
+    <div className="showdownMatrix" style={{ "--showdown-columns": shownSeats.length } as CSSProperties}>
+      {rows.map((row) => (
+        <Fragment key={row.label}>
+          <small>{row.label}</small>
+          {shownSeats.map((seat) => <div className={seat.playerId && showdown.winnerIds.includes(seat.playerId) ? "matrixWinnerCell" : ""} key={`${row.label}-${seat.playerId}`}>{row.render(seat)}</div>)}
+        </Fragment>
+      ))}
+      <small>公共牌</small>
+      <div className="showdownMatrixBoard">
+        <ReplayBoardRow title="Board A" cards={room.board.top} />
+        <ReplayBoardRow title="Board B" cards={room.board.bottom} />
+      </div>
+    </div>
+  );
+}
+
 function showdownKey(room: PublicRoomState): string {
   if (!room.showdown) return "";
-  return `${room.roomId}:${room.showdown.potAwards.map((award) => `${award.amount}-${award.winners.join(".")}`).join("|")}:${Object.entries(room.showdown.points).map(([id, points]) => `${id}-${points}`).join("|")}`;
+  return `${room.roomId}:${room.handId ?? "hand"}:${room.showdown.potAwards.map((award) => `${award.amount}-${award.winners.join(".")}`).join("|")}:${Object.entries(room.showdown.points).map(([id, points]) => `${id}-${points}`).join("|")}`;
 }
 
 function UtilityModal({ panel, setPanel, children }: { panel: UtilityPanel; setPanel: (panel: UtilityPanel) => void; children: ReactNode }) {
