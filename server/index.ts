@@ -10,6 +10,7 @@ import {
   drawRevealDecision,
   drawSelect,
   GameStore,
+  hostStand,
   joinRoom,
   pauseGame,
   privateState,
@@ -34,7 +35,6 @@ const io = new Server(server, {
 });
 const store = new GameStore();
 const autoNextHandTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const AUTO_NEXT_HAND_DELAY_MS = 5000;
 
 app.use(express.json());
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
@@ -89,6 +89,7 @@ function scheduleAutoNextHand(roomId: string): void {
   if (room.seats.filter((seat) => seat.playerId && seat.stack > 0).length < 2) return;
 
   const settledHandId = room.hand.id;
+  const delayMs = (room.settings.settlementSeconds ?? 5) * 1000;
   const timer = setTimeout(async () => {
     autoNextHandTimers.delete(roomId);
     const currentRoom = store.rooms.get(roomId);
@@ -100,7 +101,7 @@ function scheduleAutoNextHand(roomId: string): void {
     } catch {
       await broadcastRoom(roomId);
     }
-  }, AUTO_NEXT_HAND_DELAY_MS);
+  }, delayMs);
   autoNextHandTimers.set(roomId, timer);
 }
 
@@ -176,6 +177,17 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on("hostStand", async (payload: { roomId: string; playerId: string; targetPlayerId: string }, ack?: Ack) => {
+    try {
+      const room = store.getRoom(payload.roomId);
+      hostStand(room, payload.playerId, payload.targetPlayerId);
+      ok(ack);
+      await broadcastRoomAndSchedule(room.id);
+    } catch (error) {
+      fail(ack, error);
+    }
+  });
+
   socket.on("transferHost", async (payload: { roomId: string; playerId: string; targetPlayerId: string }, ack?: Ack) => {
     try {
       const room = store.getRoom(payload.roomId);
@@ -224,6 +236,7 @@ io.on("connection", (socket) => {
     try {
       const room = store.getRoom(payload.roomId);
       updateSettings(room, payload.playerId, payload.settings);
+      if (room.hand?.street === "settled") cancelAutoNextHand(room.id);
       ok(ack);
       await broadcastRoomAndSchedule(room.id);
     } catch (error) {

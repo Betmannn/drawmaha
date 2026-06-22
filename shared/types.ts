@@ -25,10 +25,12 @@ export interface RoomSettings {
   minBuyIn: number;
   maxBuyIn: number;
   thinkingTimeSeconds: number;
+  drawTimeSeconds: number;
+  settlementSeconds: number;
   gameDurationMinutes: number;
   rakePercent: number;
   rakeCap: number;
-  maxPlayers: 6;
+  maxPlayers: number;
 }
 
 export type Role = "host" | "player" | "spectator";
@@ -79,6 +81,7 @@ export interface BoardState {
 
 export interface ChatMessage {
   id: string;
+  playerId: string;
   nickname: string;
   role: Role;
   text: string;

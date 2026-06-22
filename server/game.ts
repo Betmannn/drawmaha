@@ -26,6 +26,8 @@ const defaultSettings: RoomSettings = {
   minBuyIn: 500,
   maxBuyIn: 5000,
   thinkingTimeSeconds: 30,
+  drawTimeSeconds: 30,
+  settlementSeconds: 5,
   gameDurationMinutes: 0,
   rakePercent: 0,
   rakeCap: 0,
@@ -99,9 +101,8 @@ function uid(prefix = ""): string {
 }
 
 function roomCode(): string {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
-  for (let i = 0; i < 5; i += 1) code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  for (let i = 0; i < 6; i += 1) code += Math.floor(Math.random() * 10).toString();
   return code;
 }
 
@@ -132,14 +133,16 @@ export class GameStore {
   rooms = new Map<string, RoomState>();
 
   createRoom(hostId: string, nickname: string, settings: Partial<RoomSettings>): RoomState {
-    const id = roomCode();
+    let id = roomCode();
+    while (this.rooms.has(id)) id = roomCode();
+    const normalizedSettings = normalizeSettings({ ...defaultSettings, ...settings });
     const room: RoomState = {
       id,
       hostId,
-      settings: normalizeSettings({ ...defaultSettings, ...settings }),
+      settings: normalizedSettings,
       paused: false,
       participants: new Map(),
-      seats: Array.from({ length: 6 }, (_, index) => createSeat(index)),
+      seats: Array.from({ length: normalizedSettings.maxPlayers }, (_, index) => createSeat(index)),
       pendingBuyIns: [],
       chat: [],
       replay: [],
@@ -251,6 +254,13 @@ export function stand(room: RoomState, playerId: string): void {
   participant.role = participant.id === room.hostId ? "host" : "spectator";
 }
 
+export function hostStand(room: RoomState, hostId: string, targetPlayerId: string): void {
+  requireHost(room, hostId);
+  if (hostId === targetPlayerId) throw new Error("房主请使用离桌按钮");
+  if (room.hand && room.hand.street !== "settled") throw new Error("牌局进行中不能让玩家起立");
+  stand(room, targetPlayerId);
+}
+
 export function transferHost(room: RoomState, playerId: string, targetPlayerId: string): void {
   requireHost(room, playerId);
   const target = requireParticipant(room, targetPlayerId);
@@ -329,8 +339,18 @@ function validateBuyIn(room: RoomState, participant: Participant, amount: number
 
 export function updateSettings(room: RoomState, playerId: string, settings: Partial<RoomSettings>): void {
   requireHost(room, playerId);
-  if (room.hand && room.hand.street !== "settled") throw new Error("开局后设置锁定");
-  room.settings = normalizeSettings({ ...room.settings, ...settings });
+  const next = normalizeSettings({ ...room.settings, ...settings });
+  if (room.hand && room.hand.street !== "settled") {
+    room.settings.thinkingTimeSeconds = next.thinkingTimeSeconds;
+    room.settings.drawTimeSeconds = next.drawTimeSeconds;
+    room.settings.settlementSeconds = next.settlementSeconds;
+    room.settings.gameDurationMinutes = next.gameDurationMinutes;
+    if (room.hand.currentSeat !== null && !room.paused) resetTimer(room);
+    addReplay(room, "settings", `房主更新计时：下注 ${room.settings.thinkingTimeSeconds}s / 换牌 ${room.settings.drawTimeSeconds}s / 结算 ${room.settings.settlementSeconds}s / 时长 ${room.settings.gameDurationMinutes || "不限"}${room.settings.gameDurationMinutes ? "分钟" : ""}`);
+    return;
+  }
+  resizeSeats(room, next.maxPlayers);
+  room.settings = next;
 }
 
 function sanitizeTableName(name: string): string {
@@ -341,16 +361,39 @@ function normalizeSettings(settings: Partial<RoomSettings>): RoomSettings {
   return {
     ...defaultSettings,
     ...settings,
-    maxPlayers: 6,
     tableName: sanitizeTableName(settings.tableName ?? defaultSettings.tableName),
     ante: Math.max(0, Math.floor(settings.ante ?? defaultSettings.ante)),
     minBuyIn: Math.max(1, Math.floor(settings.minBuyIn ?? defaultSettings.minBuyIn)),
     maxBuyIn: Math.max(1, Math.floor(settings.maxBuyIn ?? defaultSettings.maxBuyIn)),
     thinkingTimeSeconds: Math.max(5, Math.floor(settings.thinkingTimeSeconds ?? defaultSettings.thinkingTimeSeconds)),
+    drawTimeSeconds: Math.max(5, Math.floor(settings.drawTimeSeconds ?? settings.thinkingTimeSeconds ?? defaultSettings.drawTimeSeconds)),
+    settlementSeconds: normalizeSettlementSeconds(settings.settlementSeconds ?? defaultSettings.settlementSeconds),
     gameDurationMinutes: Math.max(0, Math.floor(settings.gameDurationMinutes ?? defaultSettings.gameDurationMinutes)),
     rakePercent: Math.min(100, Math.max(0, Number(settings.rakePercent ?? defaultSettings.rakePercent))),
-    rakeCap: Math.max(0, Math.floor(settings.rakeCap ?? defaultSettings.rakeCap))
+    rakeCap: Math.max(0, Math.floor(settings.rakeCap ?? defaultSettings.rakeCap)),
+    maxPlayers: Math.min(6, Math.max(2, Math.floor(settings.maxPlayers ?? defaultSettings.maxPlayers)))
   };
+}
+
+function normalizeSettlementSeconds(value: number): number {
+  const seconds = Math.floor(Number(value));
+  return [3, 5, 10].includes(seconds) ? seconds : defaultSettings.settlementSeconds;
+}
+
+function resizeSeats(room: RoomState, maxPlayers: number): void {
+  if (maxPlayers === room.seats.length) return;
+  if (maxPlayers < room.seats.length) {
+    const occupiedRemovedSeat = room.seats.slice(maxPlayers).find((seat) => seat.playerId);
+    if (occupiedRemovedSeat) throw new Error("缩小人数前请先让高号座位玩家起立");
+    room.seats = room.seats.slice(0, maxPlayers);
+    for (const participant of room.participants.values()) {
+      if (participant.seatIndex !== null && participant.seatIndex >= maxPlayers) participant.seatIndex = null;
+    }
+    return;
+  }
+  for (let index = room.seats.length; index < maxPlayers; index += 1) {
+    room.seats.push(createSeat(index));
+  }
 }
 
 function gameEndsAt(room: RoomState): number | null {
@@ -457,6 +500,7 @@ export function sendChat(room: RoomState, playerId: string, text: string): ChatM
   if (!cleanText) throw new Error("消息不能为空");
   const message: ChatMessage = {
     id: uid("m_"),
+    playerId,
     nickname: participant.nickname,
     role: participant.role,
     text: cleanText,
@@ -781,7 +825,18 @@ function settle(room: RoomState): void {
   room.rakeTotal += showdown.rakeTotal;
   showdown.playerResults = buildPlayerSettlement(room, showdown, rakeByPlayer);
   hand.showdown = showdown;
-  addReplay(room, "settled", "手牌结算完成", { ...showdown, board: hand.board, pot: totalPot(room) });
+  addReplay(room, "settled", "手牌结算完成", {
+    ...showdown,
+    board: hand.board,
+    pot: totalPot(room),
+    shownHands: room.seats
+      .filter((seat) => seat.playerId && showdown.shownPlayerIds.includes(seat.playerId))
+      .map((seat) => ({
+        playerId: seat.playerId!,
+        nickname: seat.nickname ?? "玩家",
+        cards: seat.hand
+      }))
+  });
 }
 
 function allocateHandRake(room: RoomState, rakeTotal: number): Map<string, number> {
@@ -1060,7 +1115,8 @@ function putToBet(room: RoomState, seat: SeatState, target: number): void {
 
 function resetTimer(room: RoomState): void {
   if (!room.hand || room.paused || room.hand.currentSeat === null) return;
-  room.hand.timerEndsAt = Date.now() + room.settings.thinkingTimeSeconds * 1000;
+  const seconds = room.hand.street.endsWith("Draw") ? room.settings.drawTimeSeconds : room.settings.thinkingTimeSeconds;
+  room.hand.timerEndsAt = Date.now() + seconds * 1000;
 }
 
 function requireParticipant(room: RoomState, playerId: string): Participant {
