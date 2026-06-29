@@ -592,12 +592,14 @@ function CardView({ card, small = false, board = false, selected = false, onClic
 function ActionPanel({ room, privateState, run }: { room: PublicRoomState; privateState: PrivateState | null; run: <T>(fn: () => Promise<T>) => Promise<T | undefined> }) {
   const [amount, setAmount] = useState(0);
   const [selected, setSelected] = useState<number[]>([]);
+  const [confirmCheckFold, setConfirmCheckFold] = useState(false);
   const legal = privateState?.legalActions;
   const mySeat = room.seats.find((seat) => seat.playerId === room.viewerId);
 
   useEffect(() => {
     setSelected([]);
     setAmount(legal?.minRaiseTo ?? 0);
+    setConfirmCheckFold(false);
   }, [room.street, room.currentSeat, legal?.minRaiseTo]);
 
   if (room.viewerRole === "spectator") {
@@ -665,6 +667,13 @@ function ActionPanel({ room, privateState, run }: { room: PublicRoomState; priva
   }
 
   const sendAction = (action: ClientAction) => run(() => emit("act", { roomId: room.roomId, playerId, action }));
+  const requestFold = () => {
+    if (legal.canCheck) {
+      setConfirmCheckFold(true);
+      return;
+    }
+    void sendAction({ type: "fold" });
+  };
   return (
     <section className="actionPanel bettingPanel">
       <div className="betInfo">
@@ -676,7 +685,7 @@ function ActionPanel({ room, privateState, run }: { room: PublicRoomState; priva
           <button onClick={() => sendAction(legal.canCheck ? { type: "check" } : { type: "call" })}>
             {legal.canCheck ? "Check" : `Call ${legal.toCall}`}
           </button>
-          <button onClick={() => sendAction({ type: "fold" })}>Fold</button>
+          <button onClick={requestFold}>Fold</button>
           <button onClick={() => setAmount(Math.floor((legal.maxRaiseTo + legal.minRaiseTo) / 2))}>1/2 Pot</button>
           <button onClick={() => setAmount(legal.maxRaiseTo)}>Pot</button>
         </div>
@@ -688,6 +697,28 @@ function ActionPanel({ room, privateState, run }: { room: PublicRoomState; priva
           </button>
         </div>
       </div>
+      {confirmCheckFold && (
+        <div className="inlineConfirmBackdrop">
+          <div className="inlineConfirm">
+            <strong>当前可以 Check</strong>
+            <p>是否仍要弃牌？</p>
+            <div className="buttonRow">
+              <button
+                className="dangerButton"
+                onClick={() => {
+                  setConfirmCheckFold(false);
+                  void sendAction({ type: "fold" });
+                }}
+              >
+                是，弃牌
+              </button>
+              <button className="primary" onClick={() => setConfirmCheckFold(false)}>
+                否，继续
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -897,7 +928,7 @@ function BuyInControl({ room, run }: { room: PublicRoomState; run: <T>(fn: () =>
 }
 
 function Scoreboard({ room }: { room: PublicRoomState }) {
-  const sorted = [...room.seats].filter((seat) => seat.playerId).sort((a, b) => b.stack - a.stack);
+  const sorted = [...room.scores].sort((a, b) => Number(b.seated) - Number(a.seated) || b.stack - a.stack);
   const isHost = room.viewerId === room.hostId;
   return (
     <section className="panel">
@@ -910,14 +941,15 @@ function Scoreboard({ room }: { room: PublicRoomState }) {
         )}
       </div>
       {isHost && <p className="scoreSummary">累计抽水 {room.rakeTotal}</p>}
-      {sorted.map((seat) => (
-        <div className="scoreRow" key={seat.index}>
-          <span>{seat.nickname}</span>
-          <strong>{seat.stack}</strong>
+      {sorted.map((record) => (
+        <div className={`scoreRow ${record.seated ? "seatedScore" : ""}`} key={record.playerId}>
+          <span>{record.nickname}</span>
+          <strong>{record.stack}</strong>
           <small>
-            带入 {seat.buyIn} / 输赢 {seat.stack - seat.buyIn >= 0 ? "+" : ""}{seat.stack - seat.buyIn}
-            {isHost ? ` / 抽水 ${seat.rakePaid}` : ""}
-            {seat.pendingBuyIn ? ` / 下局 +${seat.pendingBuyIn}` : ""}
+            {record.seated ? `在座 ${record.seatIndex !== null ? record.seatIndex + 1 : ""} / ` : "离座 / "}
+            带入 {record.buyIn} / 输赢 {record.stack - record.buyIn >= 0 ? "+" : ""}{record.stack - record.buyIn}
+            {isHost ? ` / 抽水 ${record.rakePaid}` : ""}
+            {record.pendingBuyIn ? ` / 下局 +${record.pendingBuyIn}` : ""}
           </small>
         </div>
       ))}
@@ -925,23 +957,24 @@ function Scoreboard({ room }: { room: PublicRoomState }) {
   );
 }
 
-function exportScoreboard(room: PublicRoomState, seats: PublicRoomState["seats"]): void {
-  const rows = seats.map((seat, index) => ({
+function exportScoreboard(room: PublicRoomState, records: PublicRoomState["scores"]): void {
+  const rows = records.map((record, index) => ({
     rank: index + 1,
-    nickname: seat.nickname ?? "",
-    stack: seat.stack,
-    buyIn: seat.buyIn,
-    net: seat.stack - seat.buyIn,
-    rakePaid: seat.rakePaid,
-    pendingBuyIn: seat.pendingBuyIn
+    nickname: record.nickname,
+    status: record.seated ? `在座${record.seatIndex !== null ? record.seatIndex + 1 : ""}` : "离座",
+    stack: record.stack,
+    buyIn: record.buyIn,
+    net: record.stack - record.buyIn,
+    rakePaid: record.rakePaid,
+    pendingBuyIn: record.pendingBuyIn
   }));
   const html = `<!doctype html><html><head><meta charset="utf-8" /></head><body>
     <h2>${escapeHtml(room.settings.tableName)} 积分排行</h2>
     <p>房间 ${escapeHtml(room.roomId)} / 累计抽水 ${room.rakeTotal} / 导出时间 ${new Date().toLocaleString()}</p>
     <table border="1">
-      <thead><tr><th>排名</th><th>玩家</th><th>当前积分</th><th>带入积分</th><th>输赢</th><th>累计抽水</th><th>下局待生效</th></tr></thead>
+      <thead><tr><th>排名</th><th>玩家</th><th>状态</th><th>当前积分</th><th>带入积分</th><th>输赢</th><th>累计抽水</th><th>下局待生效</th></tr></thead>
       <tbody>
-        ${rows.map((row) => `<tr><td>${row.rank}</td><td>${escapeHtml(row.nickname)}</td><td>${row.stack}</td><td>${row.buyIn}</td><td>${row.net}</td><td>${row.rakePaid}</td><td>${row.pendingBuyIn}</td></tr>`).join("")}
+        ${rows.map((row) => `<tr><td>${row.rank}</td><td>${escapeHtml(row.nickname)}</td><td>${escapeHtml(row.status)}</td><td>${row.stack}</td><td>${row.buyIn}</td><td>${row.net}</td><td>${row.rakePaid}</td><td>${row.pendingBuyIn}</td></tr>`).join("")}
       </tbody>
     </table>
   </body></html>`;

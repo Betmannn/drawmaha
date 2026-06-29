@@ -12,6 +12,7 @@ import type {
   PrivateState,
   PublicRoomState,
   PublicSeat,
+  PublicScoreRecord,
   ReplayEvent,
   Role,
   RoomSettings,
@@ -62,6 +63,10 @@ interface Participant {
   role: Role;
   seatIndex: number | null;
   lastSeatIndex: number | null;
+  stack: number;
+  buyIn: number;
+  pendingBuyIn: number;
+  rakePaid: number;
 }
 
 interface HandState {
@@ -131,6 +136,35 @@ function createSeat(index: number): SeatState {
   };
 }
 
+function createParticipant(id: string, nickname: string, role: Role): Participant {
+  return {
+    id,
+    nickname,
+    role,
+    seatIndex: null,
+    lastSeatIndex: null,
+    stack: 0,
+    buyIn: 0,
+    pendingBuyIn: 0,
+    rakePaid: 0
+  };
+}
+
+function syncParticipantFromSeat(participant: Participant, seat: SeatState): void {
+  participant.stack = seat.stack;
+  participant.buyIn = seat.buyIn;
+  participant.pendingBuyIn = seat.pendingBuyIn;
+  participant.rakePaid = seat.rakePaid;
+}
+
+function clearSeatLedger(seat: SeatState): void {
+  seat.stack = 0;
+  seat.buyIn = 0;
+  seat.pendingBuyIn = 0;
+  seat.rakePaid = 0;
+  seat.noChipsSince = null;
+}
+
 export class GameStore {
   rooms = new Map<string, RoomState>();
 
@@ -153,7 +187,7 @@ export class GameStore {
       dealerSeat: null,
       hand: null
     };
-    room.participants.set(hostId, { id: hostId, nickname, role: "host", seatIndex: null, lastSeatIndex: null });
+    room.participants.set(hostId, createParticipant(hostId, nickname, "host"));
     this.rooms.set(id, room);
     addReplay(room, "room", `${nickname} 创建房间 ${id}`);
     return room;
@@ -171,17 +205,14 @@ export function joinRoom(room: RoomState, playerId: string, nickname: string, as
   if (existing) {
     existing.nickname = nickname;
     existing.role = existing.id === room.hostId ? "host" : asSpectator ? "spectator" : existing.role;
+    if (existing.seatIndex !== null) room.seats[existing.seatIndex].nickname = nickname;
     return existing;
   }
   if ([...room.participants.values()].some((p) => p.nickname === nickname && p.id !== playerId)) {
     throw new Error("昵称已被使用");
   }
   const participant: Participant = {
-    id: playerId,
-    nickname,
-    role: playerId === room.hostId ? "host" : asSpectator ? "spectator" : "player",
-    seatIndex: null,
-    lastSeatIndex: null
+    ...createParticipant(playerId, nickname, playerId === room.hostId ? "host" : asSpectator ? "spectator" : "player")
   };
   room.participants.set(playerId, participant);
   addReplay(room, "join", `${nickname} ${asSpectator ? "加入观战" : "加入房间"}`);
@@ -204,6 +235,11 @@ export function sit(room: RoomState, playerId: string, seatIndex: number): void 
   seat.playerId = playerId;
   seat.nickname = participant.nickname;
   seat.connected = true;
+  seat.stack = participant.stack;
+  seat.buyIn = participant.buyIn;
+  seat.pendingBuyIn = participant.pendingBuyIn;
+  seat.rakePaid = participant.rakePaid;
+  seat.noChipsSince = seat.stack > 0 ? null : seat.noChipsSince;
   if (room.hand && room.hand.street !== "settled" && seat.hand.length === 0) {
     seat.folded = true;
     seat.allIn = false;
@@ -240,6 +276,7 @@ export function stand(room: RoomState, playerId: string): void {
   if (participant.seatIndex !== null) {
     const seat = room.seats[participant.seatIndex];
     const wasCurrent = room.hand?.currentSeat === seat.index;
+    syncParticipantFromSeat(participant, seat);
     if (room.hand && room.hand.street !== "settled" && !seat.folded) {
       seat.folded = true;
       seat.lastAction = "leave/fold";
@@ -250,6 +287,7 @@ export function stand(room: RoomState, playerId: string): void {
     seat.playerId = null;
     seat.nickname = null;
     seat.connected = false;
+    if (!room.hand || room.hand.street === "settled") clearSeatLedger(seat);
     participant.seatIndex = null;
     if (room.hand && room.hand.street !== "settled" && wasCurrent) advanceAfterAction(room);
   }
@@ -719,6 +757,7 @@ export function publicState(room: RoomState, viewerId: string): PublicRoomState 
     timerEndsAt: room.hand?.timerEndsAt ?? null,
     drawReveal: room.hand?.drawReveal ?? null,
     seats: room.seats.map((seat) => publicSeat(room, seat, viewerId)),
+    scores: publicScores(room),
     pendingBuyIns: room.pendingBuyIns,
     chat: room.chat,
     replay: room.replay,
@@ -741,6 +780,24 @@ export function privateState(room: RoomState, playerId: string): PrivateState | 
     pendingDrawReveal: seat.pendingDraw?.reveal ?? null,
     legalActions: room.hand?.currentSeat === seat.index && room.hand.street.endsWith("Bet") ? legalActions(room, seat) : null
   };
+}
+
+function publicScores(room: RoomState): PublicScoreRecord[] {
+  return [...room.participants.values()]
+    .filter((participant) => participant.role !== "spectator" || participant.seatIndex !== null || participant.lastSeatIndex !== null || participant.buyIn > 0 || participant.stack > 0 || participant.pendingBuyIn > 0)
+    .map((participant) => {
+      const seat = participant.seatIndex !== null ? room.seats[participant.seatIndex] : null;
+      return {
+        playerId: participant.id,
+        nickname: participant.nickname,
+        stack: seat?.playerId === participant.id ? seat.stack : participant.stack,
+        buyIn: seat?.playerId === participant.id ? seat.buyIn : participant.buyIn,
+        pendingBuyIn: seat?.playerId === participant.id ? seat.pendingBuyIn : participant.pendingBuyIn,
+        rakePaid: seat?.playerId === participant.id ? seat.rakePaid : participant.rakePaid,
+        seated: seat?.playerId === participant.id,
+        seatIndex: seat?.playerId === participant.id ? seat.index : null
+      };
+    });
 }
 
 function publicSeat(room: RoomState, seat: SeatState, viewerId: string): PublicSeat {

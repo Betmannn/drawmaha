@@ -54,6 +54,17 @@ export interface PublicSeat {
   cards?: (Card | "back")[];
 }
 
+export interface PublicScoreRecord {
+  playerId: string;
+  nickname: string;
+  stack: number;
+  buyIn: number;
+  pendingBuyIn: number;
+  rakePaid: number;
+  seated: boolean;
+  seatIndex: number | null;
+}
+
 export interface PrivateState {
   playerId: string;
   hand: Card[];
@@ -159,6 +170,7 @@ export interface PublicRoomState {
   timerEndsAt: number | null;
   drawReveal: DrawRevealPublic | null;
   seats: PublicSeat[];
+  scores: PublicScoreRecord[];
   pendingBuyIns: BuyInRequest[];
   chat: ChatMessage[];
   replay: ReplayEvent[];
